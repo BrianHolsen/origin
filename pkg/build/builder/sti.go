@@ -315,9 +315,6 @@ func (s *S2IBuilder) Build() error {
 		return err
 	}
 
-	cName := containerName("s2i", s.build.Name, s.build.Namespace, "post-commit")
-	err = execPostCommitHook(ctx, s.dockerClient, s.build.Spec.PostCommit, buildTag, cName)
-
 	if err != nil {
 		s.build.Status.Phase = buildapiv1.BuildPhaseFailed
 		s.build.Status.Reason = buildapiv1.StatusReasonPostCommitHookFailed

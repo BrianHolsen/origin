@@ -2,7 +2,6 @@ package builder
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha1"
 	"encoding/json"
 	"fmt"
@@ -23,7 +22,6 @@ import (
 	"github.com/docker/distribution/reference"
 	dockercmd "github.com/docker/docker/builder/dockerfile/command"
 	"github.com/docker/docker/builder/dockerfile/parser"
-	"github.com/fsouza/go-dockerclient"
 	"github.com/openshift/imagebuilder"
 	s2igit "github.com/openshift/source-to-image/pkg/scm/git"
 	"github.com/openshift/source-to-image/pkg/util"
@@ -166,19 +164,17 @@ func containerName(strategyName, buildName, namespace, containerPurpose string) 
 		uid)
 }
 
-// execPostCommitHook uses the client to execute a command based on the
-// postCommitSpec in a new ephemeral Docker container running the given image.
-// It returns an error if the hook cannot be run or returns a non-zero exit
-// code.
-func execPostCommitHook(ctx context.Context, client DockerClient, postCommitSpec buildapiv1.BuildPostCommitSpec, image, containerName string) error {
+// buildPostCommit transforms the postCommitSpec into dockerfile commands
+// and writes them to the dockerfile that is produced
+func buildPostCommit(postCommitSpec buildapiv1.BuildPostCommitSpec) string {
 	command := postCommitSpec.Command
 	args := postCommitSpec.Args
 	script := postCommitSpec.Script
 	if script == "" && len(command) == 0 && len(args) == 0 {
 		// Post commit hook is not set, return early.
-		return nil
+		return ""
 	}
-	glog.V(0).Infof("Running post commit hook ...")
+	glog.V(0).Infof("Building post commit hook ...")
 	glog.V(4).Infof("Post commit hook spec: %+v", postCommitSpec)
 
 	if script != "" {
@@ -190,45 +186,8 @@ func execPostCommitHook(ctx context.Context, client DockerClient, postCommitSpec
 		command = []string{"/bin/sh", "-ic"}
 		args = append([]string{script, command[0]}, args...)
 	}
+	return fmt.Sprintf("%s %s", strings.Join(command, " "), strings.Join(args, " "))
 
-	limits, err := GetCGroupLimits()
-	if err != nil {
-		return fmt.Errorf("read cgroup limits: %v", err)
-	}
-	parent, err := getCgroupParent()
-	if err != nil {
-		return fmt.Errorf("read cgroup parent: %v", err)
-	}
-	startTime := metav1.Now()
-
-	err = dockerRun(client, docker.CreateContainerOptions{
-		Name: containerName,
-		Config: &docker.Config{
-			Image:      image,
-			Entrypoint: command,
-			Cmd:        args,
-		},
-		HostConfig: &docker.HostConfig{
-			// Limit container's resource allocation.
-			// Though we are capped on memory and cpu at the cgroup parent level,
-			// some build containers care what their memory limit is so they can
-			// adapt, thus we need to set the memory limit at the container level
-			// too, so that information is available to them.
-			Memory:       limits.MemoryLimitBytes,
-			MemorySwap:   limits.MemorySwap,
-			CgroupParent: parent,
-		},
-	}, docker.AttachToContainerOptions{
-		// Stream logs to stdout and stderr.
-		OutputStream: os.Stdout,
-		ErrorStream:  os.Stderr,
-		Stream:       true,
-		Stdout:       true,
-		Stderr:       true,
-	})
-	timing.RecordNewStep(ctx, buildapiv1.StagePostCommit, buildapiv1.StepExecPostCommitHook, startTime, metav1.Now())
-
-	return err
 }
 
 // GetSourceRevision returns a SourceRevision object either from the build (if it already had one)
@@ -404,7 +363,6 @@ func addBuildParameters(dir string, build *buildapiv1.Build, sourceInfo *git.Sou
 	if err != nil {
 		return err
 	}
-
 	// Update base image if build strategy specifies the From field.
 	if build.Spec.Strategy.DockerStrategy != nil && build.Spec.Strategy.DockerStrategy.From != nil && build.Spec.Strategy.DockerStrategy.From.Kind == "DockerImage" {
 		// Reduce the name to a minimal canonical form for the daemon
@@ -425,6 +383,11 @@ func addBuildParameters(dir string, build *buildapiv1.Build, sourceInfo *git.Sou
 
 	// Append build labels.
 	if err := appendLabel(node, buildLabels(build, sourceInfo)); err != nil {
+		return err
+	}
+
+	// Append post commit
+	if err := appendPostCommit(node, buildPostCommit(build.Spec.PostCommit)); err != nil {
 		return err
 	}
 
@@ -481,16 +444,17 @@ func replaceImagesFromSource(node *parser.Node, imageSources []buildapiv1.ImageS
 
 // findReferencedImages returns all qualified images referenced by the Dockerfile, whether the
 // build is a multi-stage build, or returns an error.
-func findReferencedImages(dockerfilePath string) ([]string, bool, error) {
+func findReferencedImages(dockerfilePath string) ([]string, sets.String, bool, error) {
 	if len(dockerfilePath) == 0 {
-		return nil, false, nil
+		return nil, nil, false, nil
 	}
 	node, err := imagebuilder.ParseFile(dockerfilePath)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	names := make(map[string]string)
 	images := sets.NewString()
+	aliases := sets.NewString()
 	stages := imagebuilder.NewStages(node, imagebuilder.NewBuilder(nil))
 	for _, stage := range stages {
 		for _, child := range stage.Node.Children {
@@ -499,6 +463,9 @@ func findReferencedImages(dockerfilePath string) ([]string, bool, error) {
 				image := child.Next.Value
 				names[stage.Name] = image
 				images.Insert(image)
+				if child.Next.Next != nil && child.Next.Next.Value == "as" {
+					aliases.Insert(child.Next.Next.Next.Value)
+				}
 			case child.Value == dockercmd.Copy:
 				if ref, ok := nodeHasFromRef(child); ok {
 					if len(ref) > 0 {
@@ -510,7 +477,7 @@ func findReferencedImages(dockerfilePath string) ([]string, bool, error) {
 			}
 		}
 	}
-	return images.List(), len(stages) > 1, nil
+	return images.List(), aliases, len(stages) > 1, nil
 }
 
 func overwriteFile(name string, out []byte) error {

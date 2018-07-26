@@ -85,7 +85,7 @@ func (d *DockerBuilder) Build() error {
 	buildTag := randomBuildTag(d.build.Namespace, d.build.Name)
 	dockerfilePath := getDockerfilePath(buildDir, d.build)
 
-	imageNames, multiStage, err := findReferencedImages(dockerfilePath)
+	imageNames, aliasNames, multiStage, err := findReferencedImages(dockerfilePath)
 	if err != nil {
 		return err
 	}
@@ -99,7 +99,7 @@ func (d *DockerBuilder) Build() error {
 		}
 		imageExists := true
 		_, err = d.dockerClient.InspectImage(imageName)
-		if err != nil {
+		if err != nil && !aliasNames.Has(imageName) {
 			if err != docker.ErrNoSuchImage {
 				return err
 			}
@@ -148,10 +148,6 @@ func (d *DockerBuilder) Build() error {
 		HandleBuildStatusUpdate(d.build, d.client, nil)
 		return err
 	}
-
-	cname := containerName("docker", d.build.Name, d.build.Namespace, "post-commit")
-
-	err = execPostCommitHook(ctx, d.dockerClient, d.build.Spec.PostCommit, buildTag, cname)
 
 	if err != nil {
 		d.build.Status.Phase = buildapiv1.BuildPhaseFailed
@@ -402,6 +398,22 @@ func getDockerfilePath(dir string, build *buildapiv1.Build) string {
 	return dockerfilePath
 }
 
+// addAliasToFrom appends an alias of the form "as <alias>" to an existing
+// FROM command at <index>
+func addAliasToFrom(node *parser.Node, index int, alias string) error {
+	if node == nil {
+		return nil
+	}
+	// Add index out of range check
+	child := node.Children[index]
+	if child != nil && child.Value == dockercmd.From && child.Next != nil {
+		if child.Next.Next == nil {
+			child.Next.Next = &parser.Node{Value: "as", Next: &parser.Node{Value: alias}}
+		}
+	}
+	return nil
+}
+
 // replaceLastFrom changes the last FROM instruction of node to point to the
 // base image.
 func replaceLastFrom(node *parser.Node, image string) error {
@@ -435,6 +447,46 @@ func appendLabel(node *parser.Node, m []dockerfile.KeyValue) error {
 		return nil
 	}
 	return appendKeyValueInstruction(dockerfile.Label, node, m)
+}
+
+// appendPostCommit appends a RUN Dockerfile instruction as the last child of node
+// with keys and values from m.
+func appendPostCommit(node *parser.Node, cmd string) error {
+	if len(cmd) == 0 {
+		return nil
+	}
+	indices := dockerfile.FindAll(node, dockercmd.From)
+
+	addAliasToFrom(node, indices[0], "appimage")
+
+	if err := appendStringInstruction(dockerfile.From, node, "appimage"); err != nil {
+		return err
+	}
+
+	if err := appendStringInstruction(dockerfile.Run, node, cmd); err != nil {
+		return err
+	}
+
+	if err := appendStringInstruction(dockerfile.From, node, "appimage"); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// appendStringInstruction is a primitive used to avoid code duplication.
+// Callers should use a derivative of this such as appendPostCommit.
+// appendStringInstruction appends a Dockerfile instruction with string
+// syntax created by f as the last child of node with the string from cmd.
+func appendStringInstruction(f func(string) (string, error), node *parser.Node, cmd string) error {
+	if node == nil {
+		return nil
+	}
+	instruction, err := f(cmd)
+	if err != nil {
+		return err
+	}
+	return dockerfile.InsertInstructions(node, len(node.Children), instruction)
 }
 
 // appendKeyValueInstruction is a primitive used to avoid code duplication.
